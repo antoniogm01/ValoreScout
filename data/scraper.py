@@ -1,17 +1,19 @@
 """
 data/scraper.py
 ===============
-Pipeline de datos para ValoreScout.
+Pipeline de datos para ValoreScout — versión 2 corregida.
 
-Fuentes:
-  - FBref via soccerdata  → métricas avanzadas de rendimiento
-  - Transfermarkt         → valores de mercado históricos y fees
+Cambios vs v1:
+  - stat_types correctos para soccerdata: standard, shooting, playing_time, misc
+  - Aplanado de MultiIndex columns (FBref devuelve columnas jerárquicas)
+  - Transfermarkt via requests+BS4 (soccerdata no tiene TM)
+  - Usa 'Big 5 European Leagues Combined' (más eficiente)
 
 Uso:
-    python data/scraper.py --league "Big 5" --season 2024
+    python data/scraper.py --seasons 2024
+    python data/scraper.py --process-only   # solo procesar datos ya descargados
 """
 
-import os
 import time
 import argparse
 import logging
@@ -19,6 +21,8 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+import requests
+from bs4 import BeautifulSoup
 import soccerdata as sd
 
 # ---------------------------------------------------------------------------
@@ -37,277 +41,241 @@ PROC_DIR = Path(__file__).parent / "processed"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 PROC_DIR.mkdir(parents=True, exist_ok=True)
 
-# Ligas soportadas (notación soccerdata/FBref)
-LEAGUES = {
-    "ESP-La Liga":        "La Liga",
-    "ENG-Premier League": "Premier League",
-    "GER-Bundesliga":     "Bundesliga",
-    "ITA-Serie A":        "Serie A",
-    "FRA-Ligue 1":        "Ligue 1"
-}
+LEAGUE_MODE  = "Big 5 European Leagues Combined"
+VALID_STATS  = ["standard", "shooting", "playing_time", "misc"]
 
 
 # ---------------------------------------------------------------------------
-# FBref — métricas avanzadas
+# Helper — aplanar MultiIndex
+# ---------------------------------------------------------------------------
+
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FBref devuelve columnas MultiIndex tipo ('Standard', 'Gls').
+    Las convertimos a strings planos: 'standard_gls'
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join(str(level).strip().lower().replace(" ", "_")
+                     for level in col if level and str(level).strip())
+            for col in df.columns
+        ]
+    else:
+        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    return df
+
+
+# ---------------------------------------------------------------------------
+# FBref
 # ---------------------------------------------------------------------------
 
 class FBrefPipeline:
-    """
-    Descarga métricas avanzadas de jugadores desde FBref via soccerdata.
 
-    Métricas recogidas por jugador y temporada:
-      - Goles, asistencias, xG, xAG
-      - Progressive passes, progressive carries, progressive receptions
-      - Tackles, interceptions, blocks (defensive)
-      - Minutos jugados, partidos
-    """
-
-    def __init__(self, leagues: list[str], seasons: list[int]):
-        self.leagues = leagues
+    def __init__(self, seasons: list[int]):
         self.seasons = seasons
-        self.fbref   = sd.FBref(leagues=leagues, seasons=seasons)
-
-    def fetch_shooting(self) -> pd.DataFrame:
-        log.info("FBref → shooting stats...")
-        try:
-            df = self.fbref.read_player_season_stats(stat_type="shooting")
-            return df
-        except Exception as e:
-            log.error(f"Error fetching shooting: {e}")
-            return pd.DataFrame()
-
-    def fetch_passing(self) -> pd.DataFrame:
-        log.info("FBref → passing stats...")
-        try:
-            df = self.fbref.read_player_season_stats(stat_type="passing")
-            return df
-        except Exception as e:
-            log.error(f"Error fetching passing: {e}")
-            return pd.DataFrame()
-
-    def fetch_defense(self) -> pd.DataFrame:
-        log.info("FBref → defensive stats...")
-        try:
-            df = self.fbref.read_player_season_stats(stat_type="defense")
-            return df
-        except Exception as e:
-            log.error(f"Error fetching defense: {e}")
-            return pd.DataFrame()
-
-    def fetch_misc(self) -> pd.DataFrame:
-        log.info("FBref → misc stats (cards, fouls, aerial)...")
-        try:
-            df = self.fbref.read_player_season_stats(stat_type="misc")
-            return df
-        except Exception as e:
-            log.error(f"Error fetching misc: {e}")
-            return pd.DataFrame()
+        self.fbref   = sd.FBref(leagues=[LEAGUE_MODE], seasons=seasons)
 
     def fetch_all(self) -> pd.DataFrame:
-        """Descarga y une todas las tablas por jugador/temporada/equipo."""
         dfs = {}
-        for stat in ["shooting", "passing", "defense", "misc", "possession"]:
+        for stat in VALID_STATS:
             log.info(f"FBref → {stat}...")
             try:
-                dfs[stat] = self.fbref.read_player_season_stats(stat_type=stat)
-                time.sleep(3)   # respetar rate limit de FBref
+                df = self.fbref.read_player_season_stats(stat_type=stat)
+                df = flatten_columns(df.reset_index())
+                dfs[stat] = df
+                log.info(f"  ✓ {len(df)} filas, {len(df.columns)} cols")
+                time.sleep(4)
             except Exception as e:
                 log.warning(f"  Skipping {stat}: {e}")
 
         if not dfs:
-            log.error("No se pudo descargar ninguna tabla de FBref.")
             return pd.DataFrame()
 
-        # Merge progresivo sobre índice común
         base = list(dfs.values())[0]
-        for key, df in list(dfs.items())[1:]:
-            try:
-                base = base.join(df, how="outer", rsuffix=f"_{key}")
-            except Exception as e:
-                log.warning(f"  No se pudo hacer join de {key}: {e}")
+        key_cols = [c for c in ["league", "season", "team", "player"] if c in base.columns]
 
+        for stat, df in list(dfs.items())[1:]:
+            available_keys = [c for c in key_cols if c in df.columns]
+            new_cols = available_keys + [c for c in df.columns if c not in base.columns]
+            try:
+                base = base.merge(df[new_cols], on=available_keys, how="left")
+            except Exception as e:
+                log.warning(f"  Merge {stat} fallido: {e}")
+
+        log.info(f"FBref final: {len(base)} jugadores, {len(base.columns)} columnas")
         return base
 
-    def save(self, df: pd.DataFrame, name: str = "fbref_players"):
+    def save(self, df: pd.DataFrame):
         if df.empty:
-            log.warning("DataFrame vacío — nada que guardar.")
+            log.warning("FBref vacío.")
             return
-        path = RAW_DIR / f"{name}.parquet"
-        df.to_parquet(path)
-        log.info(f"Guardado: {path}  ({len(df)} filas)")
+        path = RAW_DIR / "fbref_players.parquet"
+        df.to_parquet(path, index=False)
+        log.info(f"Guardado: {path}")
+        print("\nColumnas disponibles en FBref:")
+        for c in sorted(df.columns):
+            print(f"  {c}")
 
 
 # ---------------------------------------------------------------------------
-# Transfermarkt — valores de mercado
+# Transfermarkt
 # ---------------------------------------------------------------------------
 
-class TransfermarktPipeline:
-    """
-    Descarga valores de mercado desde Transfermarkt via soccerdata.
+class TransfermarktScraper:
+    """Scraper ligero de valores de mercado por equipo."""
 
-    Columnas clave:
-      - player_name, player_id
-      - market_value_eur  (valor actual en €)
-      - date              (fecha de la valoración)
-      - age, position, nationality
-      - club, league
-    """
+    BASE    = "https://www.transfermarkt.com"
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    LEAGUES = {
+        "La Liga":        "/primera-division/startseite/wettbewerb/ES1",
+        "Premier League": "/premier-league/startseite/wettbewerb/GB1",
+        "Bundesliga":     "/bundesliga/startseite/wettbewerb/L1",
+        "Serie A":        "/serie-a/startseite/wettbewerb/IT1",
+        "Ligue 1":        "/ligue-1/startseite/wettbewerb/FR1",
+    }
 
-    def __init__(self, leagues: list[str], seasons: list[int]):
-        self.leagues = leagues
-        self.seasons = seasons
+    def fetch_league(self, league: str, season: int) -> pd.DataFrame:
+        url = f"{self.BASE}{self.LEAGUES[league]}/plus/?saison_id={season}"
+        log.info(f"Transfermarkt → {league} {season}...")
         try:
-            self.tm = sd.Transfermarkt(leagues=leagues, seasons=seasons)
+            r = requests.get(url, headers=self.HEADERS, timeout=15)
+            r.raise_for_status()
         except Exception as e:
-            log.error(f"Error inicializando Transfermarkt: {e}")
-            self.tm = None
-
-    def fetch_player_valuations(self) -> pd.DataFrame:
-        if self.tm is None:
-            return pd.DataFrame()
-        log.info("Transfermarkt → player valuations...")
-        try:
-            df = self.tm.read_player_market_values()
-            return df
-        except Exception as e:
-            log.error(f"Error fetching valuations: {e}")
+            log.error(f"  Error: {e}")
             return pd.DataFrame()
 
-    def fetch_transfers(self) -> pd.DataFrame:
-        if self.tm is None:
-            return pd.DataFrame()
-        log.info("Transfermarkt → transfer history...")
-        try:
-            df = self.tm.read_transfers()
-            return df
-        except Exception as e:
-            log.error(f"Error fetching transfers: {e}")
+        soup  = BeautifulSoup(r.text, "lxml")
+        table = soup.find("table", {"class": "items"})
+        if table is None:
+            log.warning(f"  Tabla no encontrada para {league} — TM puede estar bloqueando.")
             return pd.DataFrame()
 
-    def save(self, df: pd.DataFrame, name: str = "tm_valuations"):
+        rows = []
+        for row in table.find_all("tr", {"class": ["odd", "even"]}):
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue
+            rows.append({
+                "team":            cells[0].get_text(strip=True),
+                "league":          league,
+                "season":          season,
+                "total_value_str": cells[-1].get_text(strip=True),
+            })
+
+        df = pd.DataFrame(rows)
+        log.info(f"  ✓ {len(df)} equipos")
+        time.sleep(3)
+        return df
+
+    def fetch_all(self, season: int) -> pd.DataFrame:
+        dfs = [self.fetch_league(lg, season) for lg in self.LEAGUES]
+        return pd.concat([d for d in dfs if not d.empty], ignore_index=True)
+
+    def save(self, df: pd.DataFrame):
         if df.empty:
-            log.warning("DataFrame vacío — nada que guardar.")
+            log.warning("TM vacío — continuando solo con FBref.")
             return
-        path = RAW_DIR / f"{name}.parquet"
-        df.to_parquet(path)
-        log.info(f"Guardado: {path}  ({len(df)} filas)")
+        path = RAW_DIR / "tm_team_values.parquet"
+        df.to_parquet(path, index=False)
+        log.info(f"Guardado: {path}  ({len(df)} equipos)")
 
 
 # ---------------------------------------------------------------------------
-# Procesador — unifica FBref + Transfermarkt
+# Procesador
 # ---------------------------------------------------------------------------
 
 class DataProcessor:
-    """
-    Une los datos de FBref y Transfermarkt en un dataset maestro por jugador.
 
-    Columnas del dataset final:
-      player_name, season, club, league, position, age,
-      market_value_eur, minutes_played, availability_rate,
-      xg_per90, xag_per90, progressive_passes_per90,
-      progressive_carries_per90, tackles_per90, interceptions_per90,
-      performance_score (compuesto)
-    """
+    def load(self) -> pd.DataFrame:
+        path = RAW_DIR / "fbref_players.parquet"
+        if not path.exists():
+            log.error("No existe fbref_players.parquet — ejecuta primero sin --process-only")
+            return pd.DataFrame()
+        df = pd.read_parquet(path)
+        log.info(f"Cargado: {len(df)} jugadores, {len(df.columns)} columnas")
+        return df
 
-    def __init__(self):
-        self.fbref_path = RAW_DIR / "fbref_players.parquet"
-        self.tm_path    = RAW_DIR / "tm_valuations.parquet"
-
-    def load(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        fbref = pd.read_parquet(self.fbref_path) if self.fbref_path.exists() else pd.DataFrame()
-        tm    = pd.read_parquet(self.tm_path)    if self.tm_path.exists()    else pd.DataFrame()
-        log.info(f"Cargado FBref: {len(fbref)} filas | TM: {len(tm)} filas")
-        return fbref, tm
-
-    def clean_fbref(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normaliza columnas y calcula métricas per90."""
-        if df.empty:
-            return df
-
+    def clean(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
 
-        # Minutos jugados — columna puede variar por versión
-        min_col = next((c for c in df.columns if "min" in c and "90" not in c), None)
-        if min_col:
-            df["minutes_played"] = pd.to_numeric(df[min_col], errors="coerce").fillna(0)
-            df["availability_rate"] = (df["minutes_played"] / (90 * 38)).clip(0, 1)
+        # Minutos — columna '90s' × 90 o columna 'min'
+        if "90s" in df.columns:
+            df["minutes_played"] = pd.to_numeric(df["90s"], errors="coerce").fillna(0) * 90
+        elif "playing_time_min" in df.columns:
+            df["minutes_played"] = pd.to_numeric(df["playing_time_min"], errors="coerce").fillna(0)
+        else:
+            min_col = next((c for c in df.columns if c.endswith("_min") or c == "min"), None)
+            df["minutes_played"] = pd.to_numeric(df[min_col], errors="coerce").fillna(0) if min_col else 0
 
-        # xG y xAG per90
-        for raw, per90 in [("xg", "xg_per90"), ("xag", "xag_per90"),
-                            ("prg_p", "progressive_passes_per90"),
-                            ("prg_c", "progressive_carries_per90"),
-                            ("tkl", "tackles_per90"),
-                            ("int", "interceptions_per90")]:
-            col = next((c for c in df.columns if c.startswith(raw)), None)
-            if col and "minutes_played" in df.columns:
-                df[per90] = (pd.to_numeric(df[col], errors="coerce") /
-                             (df["minutes_played"] / 90)).replace([np.inf, -np.inf], np.nan)
+        df["availability_rate"] = (df["minutes_played"] / (90 * 38)).clip(0, 1)
+
+        # Métricas per90
+        per90_map = {
+            "xg_per90":                  ["expected_xg", "xg"],
+            "xag_per90":                 ["expected_xag", "xag"],
+            "goals_per90":               ["standard_gls", "gls"],
+            "assists_per90":             ["standard_ast", "ast"],
+            "progressive_passes_per90":  ["passing_prg", "prg_p"],
+            "progressive_carries_per90": ["possession_prg_c", "prg_c"],
+            "tackles_per90":             ["challenges_tkl", "tkl"],
+        }
+
+        mins = df["minutes_played"].replace(0, np.nan)
+        for out_col, candidates in per90_map.items():
+            src = next((c for c in candidates if c in df.columns), None)
+            if src:
+                raw = pd.to_numeric(df[src], errors="coerce")
+                df[out_col] = (raw / (mins / 90)).replace([np.inf, -np.inf], np.nan)
 
         return df
 
-    def compute_performance_score(self, df: pd.DataFrame,
-                                   position: str = "all") -> pd.DataFrame:
-        """
-        Score compuesto de rendimiento normalizado por posición.
-
-        Pesos por posición:
-          FW: xg 40%, xag 20%, progressive 25%, defensive 15%
-          MF: xg 20%, xag 25%, progressive 35%, defensive 20%
-          DF: xg  5%, xag 10%, progressive 20%, defensive 65%
-          GK: métricas específicas (pendiente)
-        """
+    def performance_score(self, df: pd.DataFrame) -> pd.DataFrame:
         weights = {
-            "FW": dict(xg=0.40, xag=0.20, prog=0.25, def_=0.15),
-            "MF": dict(xg=0.20, xag=0.25, prog=0.35, def_=0.20),
-            "DF": dict(xg=0.05, xag=0.10, prog=0.20, def_=0.65),
+            "xg_per90":                  0.25,
+            "xag_per90":                 0.20,
+            "goals_per90":               0.15,
+            "progressive_passes_per90":  0.20,
+            "progressive_carries_per90": 0.10,
+            "tackles_per90":             0.10,
         }
-        w = weights.get(position.upper(), weights["MF"])
-
-        metrics = {
-            "xg":   "xg_per90",
-            "xag":  "xag_per90",
-            "prog": "progressive_passes_per90",
-            "def_": "tackles_per90",
-        }
-
         score = pd.Series(0.0, index=df.index)
-        for key, col in metrics.items():
+        used  = []
+        for col, w in weights.items():
             if col in df.columns:
-                s = pd.to_numeric(df[col], errors="coerce")
+                s      = pd.to_numeric(df[col], errors="coerce")
                 normed = (s - s.mean()) / (s.std() + 1e-8)
-                score += w[key] * normed
-
+                score += w * normed.fillna(0)
+                used.append(col)
         df["performance_score"] = score
+        log.info(f"Performance score calculado con: {used}")
         return df
-
-    def merge(self, fbref: pd.DataFrame, tm: pd.DataFrame) -> pd.DataFrame:
-        """Une ambas fuentes por nombre de jugador (fuzzy si es necesario)."""
-        if fbref.empty or tm.empty:
-            log.warning("Una o ambas fuentes están vacías — merge parcial.")
-            return fbref if not fbref.empty else tm
-
-        # Intentar merge directo por nombre normalizado
-        fbref["_key"] = fbref.index.get_level_values("player").str.lower().str.strip()
-        tm["_key"]    = tm.index.get_level_values("player").str.lower().str.strip() \
-                        if "player" in tm.index.names else tm.get("player_name", pd.Series()).str.lower()
-
-        merged = fbref.merge(tm[["_key", "market_value_eur"]].drop_duplicates("_key"),
-                             on="_key", how="left")
-        log.info(f"Merge completado: {len(merged)} jugadores | "
-                 f"{merged['market_value_eur'].notna().sum()} con valor de mercado")
-        return merged
 
     def save(self, df: pd.DataFrame):
         path = PROC_DIR / "master_players.parquet"
-        df.to_parquet(path)
-        log.info(f"Dataset maestro guardado: {path}  ({len(df)} jugadores)")
-        # Preview
-        print("\n── Preview dataset maestro ──────────────────────────")
-        preview_cols = [c for c in ["minutes_played", "xg_per90", "xag_per90",
-                                     "performance_score", "market_value_eur"]
-                        if c in df.columns]
-        print(df[preview_cols].describe().round(3).to_string())
+        df.to_parquet(path, index=False)
+        log.info(f"Dataset maestro: {path}  ({len(df)} jugadores)")
+
+        # Top 10 por performance
+        id_cols   = [c for c in ["player", "team", "league", "minutes_played",
+                                  "xg_per90", "goals_per90", "performance_score"]
+                     if c in df.columns]
+        top10 = (df[id_cols]
+                 .dropna(subset=["performance_score"])
+                 .sort_values("performance_score", ascending=False)
+                 .head(10))
+
+        print("\n── Top 10 jugadores por performance score ───────────")
+        print(top10.to_string(index=False))
+        num_cols = [c for c in ["minutes_played", "xg_per90", "performance_score"] if c in df.columns]
+        print("\n── Estadísticas descriptivas ────────────────────────")
+        print(df[num_cols].describe().round(3).to_string())
         print("─────────────────────────────────────────────────────\n")
 
 
@@ -316,51 +284,35 @@ class DataProcessor:
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ValoreScout — data pipeline")
-    parser.add_argument("--leagues", nargs="+", default=list(LEAGUES.keys()),
-                        help="Códigos de liga: ESP1 ENG1 GER1 ITA1 FRA1")
-    parser.add_argument("--seasons", nargs="+", type=int, default=[2024],
-                        help="Temporadas (año de inicio): 2022 2023 2024")
-    parser.add_argument("--skip-fbref", action="store_true")
-    parser.add_argument("--skip-tm",    action="store_true")
-    parser.add_argument("--process-only", action="store_true",
-                        help="Solo procesar datos ya descargados")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="ValoreScout — data pipeline v2")
+    p.add_argument("--seasons",       nargs="+", type=int, default=[2024])
+    p.add_argument("--skip-fbref",    action="store_true")
+    p.add_argument("--skip-tm",       action="store_true")
+    p.add_argument("--process-only",  action="store_true")
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-    log.info(f"ValoreScout pipeline | ligas={args.leagues} | temporadas={args.seasons}")
+    log.info(f"ValoreScout pipeline v2 | temporadas={args.seasons}")
 
     if not args.process_only:
-        # FBref
         if not args.skip_fbref:
-            fbref_pipe = FBrefPipeline(args.leagues, args.seasons)
-            df_fbref   = fbref_pipe.fetch_all()
-            fbref_pipe.save(df_fbref)
-        else:
-            log.info("Skipping FBref download.")
+            pipe = FBrefPipeline(args.seasons)
+            df   = pipe.fetch_all()
+            pipe.save(df)
 
-        # Transfermarkt
         if not args.skip_tm:
-            tm_pipe   = TransfermarktPipeline(args.leagues, args.seasons)
-            df_vals   = tm_pipe.fetch_player_valuations()
-            tm_pipe.save(df_vals, "tm_valuations")
-            df_trans  = tm_pipe.fetch_transfers()
-            tm_pipe.save(df_trans, "tm_transfers")
-        else:
-            log.info("Skipping Transfermarkt download.")
+            tm = TransfermarktScraper()
+            df = tm.fetch_all(season=args.seasons[0])
+            tm.save(df)
 
-    # Procesado
-    processor = DataProcessor()
-    fbref, tm = processor.load()
-
-    if not fbref.empty:
-        fbref = processor.clean_fbref(fbref)
-        fbref = processor.compute_performance_score(fbref)
-
-    master = processor.merge(fbref, tm)
-    processor.save(master)
+    proc = DataProcessor()
+    df   = proc.load()
+    if not df.empty:
+        df = proc.clean(df)
+        df = proc.performance_score(df)
+        proc.save(df)
 
     log.info("Pipeline completado ✓")
 
