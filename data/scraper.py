@@ -39,11 +39,11 @@ PROC_DIR.mkdir(parents=True, exist_ok=True)
 
 # Ligas soportadas (notación soccerdata/FBref)
 LEAGUES = {
-    "ESP1": "La Liga",
-    "ENG1": "Premier League",
-    "GER1": "Bundesliga",
-    "ITA1": "Serie A",
-    "FRA1": "Ligue 1",
+    "ESP-La Liga":        "La Liga",
+    "ENG-Premier League": "Premier League",
+    "GER-Bundesliga":     "Bundesliga",
+    "ITA-Serie A":        "Serie A",
+    "FRA-Ligue 1":        "Ligue 1"
 }
 
 
